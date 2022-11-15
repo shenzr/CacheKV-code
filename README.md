@@ -9,6 +9,7 @@ CacheKV relies on Intel(R) RDT Software Package(https://github.com/intel/intel-c
 To run CacheKV, please install it first(https://github.com/intel/intel-cmt-cat/blob/master/INSTALL).
 
 ### 2.2 Compilation
+The GCC version in our environment is 7.5.0.
 ```
   $ cd hoard
   $ ./compile_install_hoard.sh
