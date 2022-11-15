@@ -31,6 +31,8 @@
 #define MAX_NANOSEC 999999999
 #define CEIL(X) ((X-(int)(X)) > 0 ? (int)(X+1) : (int)(X))
 
+#include <atomic>
+
 static volatile int threads_keepalive;
 static volatile int threads_on_hold;
 volatile static int firstime=0;
@@ -52,6 +54,7 @@ typedef struct job{
     struct job*  prev;                   /* pointer to previous job   */
     void*  (*function)(void* arg);       /* function pointer          */
     void*  arg;                          /* function's argument       */
+    std::atomic_bool isEmpty;
 } job;
 
 job* g_newjob = NULL;
@@ -63,7 +66,7 @@ typedef struct jobqueue{
     job  *front;                         /* pointer to front of queue */
     job  *rear;                          /* pointer to rear  of queue */
     bsem *has_jobs;                      /* flag as binary semaphore  */
-    volatile int   len;                  /* number of jobs in queue   */
+    std::atomic_int len;                  /* number of jobs in queue   */
 } jobqueue;
 
 
@@ -88,7 +91,7 @@ typedef struct thread{
 typedef struct thpool_{
     thread**   threads;                  /* pointer to threads        */
     volatile int num_threads_alive;      /* threads currently alive   */
-    volatile int num_threads_working;    /* threads currently working */
+    std::atomic_int num_threads_working;    /* threads currently working */
     pthread_mutex_t  thcount_lock;       /* used for thread count etc */
     jobqueue*  jobqueue_p;               /* pointer to the job queue  */
     int firstime;
@@ -130,6 +133,7 @@ struct thpool_* thpool_init(int num_threads){
 
     threads_on_hold   = 0;
     threads_keepalive = 1;
+    numthreads = 0;
 
     if ( num_threads < 0){
         num_threads = 0;
@@ -143,7 +147,7 @@ struct thpool_* thpool_init(int num_threads){
         return NULL;
     }
     thpool_p->num_threads_alive   = 0;
-    thpool_p->num_threads_working = 0;
+    thpool_p->num_threads_working.store(0);
 
     /* Initialise the job queue */
     if (jobqueue_init(thpool_p) == -1){
@@ -171,7 +175,7 @@ struct thpool_* thpool_init(int num_threads){
     int n;
     for (n=0; n<num_threads; n++){
         //thread_init(thpool_p, &thpool_p->threads[n], 22);
-        thread_init(thpool_p, &thpool_p->threads[n], numthreads);
+        thread_init(thpool_p, &thpool_p->threads[n], n);
         if (THPOOL_DEBUG)
             printf("THPOOL_DEBUG: Created thread %d in pool \n", n);
         numthreads++;
@@ -179,23 +183,24 @@ struct thpool_* thpool_init(int num_threads){
 
     /* Wait for threads to initialize */
     while (thpool_p->num_threads_alive != num_threads) {}
-
-    g_newjob=(struct job*)malloc(sizeof(struct job));
+    g_newjob=(struct job*)malloc(sizeof(struct job) * num_threads);
     if (g_newjob==NULL){
         fprintf(stderr, "thpool_add_work(): Could not allocate memory for new job\n");
         return NULL;
     }
-
+    for(int i=0; i<num_threads; i++)
+        g_newjob[i].isEmpty.store(1);
 
     return thpool_p;
 }
 
 /* Add work to the thread pool */
-int thpool_add_work(thpool_* thpool_p, void *(*function_p)(void*), void* arg_p){
+int thpool_add_work(thpool_* thpool_p, void *(*function_p)(void*), void* arg_p, int i){
 
     /* add function and argument */
-    g_newjob->function=function_p;
-    g_newjob->arg=arg_p;
+    g_newjob[i].function=function_p;
+    g_newjob[i].arg=arg_p;
+    g_newjob[i].isEmpty.store(0);
     thpool_p->jobqueue_p->len++;
     //pthread_mutex_lock(&thpool_p->jobqueue_p->rwmutex);
     /* add job to queue */
@@ -231,7 +236,7 @@ int thpool_add_work(thpool_* thpool_p, void *(*function_p)(void*), void* arg_p){
 
 int get_jobqueue_len(thpool_* thpool_p) {
 
-    return thpool_p->jobqueue_p->len;
+    return thpool_p->jobqueue_p->len.load();
 }
 
 
@@ -244,12 +249,12 @@ void thpool_wait(thpool_* thpool_p){
     //double tpassed = 0.0;
     //time (&start);
 
-    while (thpool_p->jobqueue_p->len || thpool_p->num_threads_working)
+    while (thpool_p->jobqueue_p->len.load() || thpool_p->num_threads_working.load())
     {
         //time (&end);
         //tpassed = difftime(end,start);
-        ATOMIC_LOAD(&thpool_p->jobqueue_p->len);
-        ATOMIC_LOAD(&thpool_p->num_threads_working);
+        //ATOMIC_LOAD(&thpool_p->jobqueue_p->len);
+        //ATOMIC_LOAD(&thpool_p->num_threads_working);
     }
 
     /* Exponential polling */
@@ -346,9 +351,10 @@ int th_setaffinity(pthread_t *thread, int cpuid)
     //TODO: Simply returns a core from decrementing order
     //Needs fix to identify cores that are used by other threads
     //of this process and return a free core.
-    coreid = get_free_core();
+    //coreid = get_free_core();
     //fprintf(stderr, "Setting affinity for read thread to %d\n", coreid);
-    CPU_SET(coreid, &cpuset);
+    for(int i=0; i<31; i+=2)
+        CPU_SET(i, &cpuset);
     s = pthread_setaffinity_np(*thread, sizeof(cpu_set_t), &cpuset);
     if (s != 0) {
         fprintf(stderr, "FAILED \n");
@@ -415,24 +421,24 @@ static void* thread_do(void *arg){
 
         if(!thpool_p->firstime){
           while(thpool_p->jobqueue_p == NULL ||
-                  thpool_p->jobqueue_p->len == 0);
+                  thpool_p->jobqueue_p->len.load() == 0);
 		  thpool_p->firstime = 1;
 
         }else {
-            while(thpool_p->jobqueue_p->len == 0){
-                ATOMIC_LOAD(&thpool_p->jobqueue_p->len);
-            }
+            while(1){
+         		if(thpool_p->jobqueue_p->len.load() && !g_newjob[thread_id % numthreads].isEmpty.load())
+					break;
+	    	}
 
-            FTL_ATOMIC_ADD_FETCH(&thpool_p->num_threads_working, 1);
+			thpool_p->num_threads_working++;
+			thpool_p->jobqueue_p->len--;
 
-            //job_p = jobqueue_pull(thpool_p);
-            //if(thpool_p->jobqueue_p->len)
-            FTL_ATOMIC_SUB_FETCH(&thpool_p->jobqueue_p->len, 1);
 
-            if (g_newjob)
-                g_newjob->function(g_newjob->arg);
+            g_newjob[thread_id % numthreads].function(g_newjob[thread_id % numthreads].arg);
 
-            FTL_ATOMIC_SUB_FETCH(&thpool_p->num_threads_working, 1);
+            g_newjob[thread_id % numthreads].isEmpty.store(1);
+
+			thpool_p->num_threads_working--;
         }
     }
     pthread_mutex_lock(&thpool_p->thcount_lock);
@@ -524,7 +530,7 @@ static int jobqueue_init(thpool_* thpool_p){
     if (thpool_p->jobqueue_p == NULL){
         return -1;
     }
-    thpool_p->jobqueue_p->len = 0;
+    thpool_p->jobqueue_p->len.store(0);
     thpool_p->jobqueue_p->front = NULL;
     thpool_p->jobqueue_p->rear  = NULL;
 
@@ -543,14 +549,14 @@ static int jobqueue_init(thpool_* thpool_p){
 /* Clear the queue */
 static void jobqueue_clear(thpool_* thpool_p){
 
-    while(thpool_p->jobqueue_p->len){
+    while(thpool_p->jobqueue_p->len.load()){
         free(jobqueue_pull(thpool_p));
     }
 
     thpool_p->jobqueue_p->front = NULL;
     thpool_p->jobqueue_p->rear  = NULL;
     bsem_reset(thpool_p->jobqueue_p->has_jobs);
-    thpool_p->jobqueue_p->len = 0;
+    thpool_p->jobqueue_p->len.store(0);
 
 }
 
@@ -563,7 +569,7 @@ static void jobqueue_push(thpool_* thpool_p, struct job* newjob){
 
     newjob->prev = NULL;
 
-    switch(thpool_p->jobqueue_p->len){
+    switch(thpool_p->jobqueue_p->len.load()){
 
     case 0:  /* if no jobs in queue */
         thpool_p->jobqueue_p->front = newjob;
@@ -575,7 +581,8 @@ static void jobqueue_push(thpool_* thpool_p, struct job* newjob){
         thpool_p->jobqueue_p->rear = newjob;
 
     }
-    FTL_ATOMIC_ADD_FETCH(&thpool_p->jobqueue_p->len, 1);
+    //FTL_ATOMIC_ADD_FETCH(&thpool_p->jobqueue_p->len, 1);
+	thpool_p->jobqueue_p->len++;
     //if(!thpool_p->firstime)
     //bsem_post(thpool_p->jobqueue_p->has_jobs);
 }
@@ -590,7 +597,7 @@ static struct job* jobqueue_pull(thpool_* thpool_p){
     job* job_p;
     job_p = thpool_p->jobqueue_p->front;
 
-    switch(thpool_p->jobqueue_p->len){
+    switch(thpool_p->jobqueue_p->len.load()){
 
     case 0:  /* if no jobs in queue */
         break;
@@ -598,7 +605,7 @@ static struct job* jobqueue_pull(thpool_* thpool_p){
     case 1:  /* if one job in queue */
         thpool_p->jobqueue_p->front = NULL;
         thpool_p->jobqueue_p->rear  = NULL;
-        thpool_p->jobqueue_p->len = 0;
+        thpool_p->jobqueue_p->len.store(0);
         break;
 
     default: /* if >1 jobs in queue */

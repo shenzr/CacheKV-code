@@ -58,6 +58,7 @@ public:
 #else
     void Insert(const Key& key);
 #endif
+    void InsertNode(void *n);
 
     // Returns true iff an entry that compares equal to key is in the list.
     bool Contains(const Key& key) const;
@@ -82,6 +83,7 @@ public:
 #else
         const Key& key() const;
 #endif
+        const Key& set_key_offset(Key new_off) const;
 
         // Advances to the next position.
         // REQUIRES: Valid()
@@ -105,13 +107,13 @@ public:
         //void SetHead(void *ptr);
         Node* node_;
 
-    private:
+    //private:
         const SkipList* list_;
         // Intentionally copyable
     };
-
-private:
     enum { kMaxHeight = 12 };
+private:
+    //enum { kMaxHeight = 12 };
 
     // Immutable after construction
     Comparator const compare_;
@@ -172,9 +174,10 @@ public:
 template<typename Key, class Comparator>
 struct SkipList<Key,Comparator>::Node {
 #ifdef USE_OFFSETS
-    explicit Node(const Key& k, const Key& mem) : key_offset(reinterpret_cast<const Key>(mem - k)) { }
-
-    Key const key_offset;
+    explicit Node(const Key& k, const Key& mem) : key_offset(reinterpret_cast<const Key>(k)) { }
+    explicit Node(const Key& k, const Key& mem, int h) : key_offset(reinterpret_cast<const Key>(k)), height(h) { }
+    Key key_offset;
+    int height;
 #else
     explicit Node(const Key& k) : key(k) { }
 
@@ -187,7 +190,7 @@ struct SkipList<Key,Comparator>::Node {
 
 #if defined(USE_OFFSETS)
         intptr_t offset = reinterpret_cast<intptr_t>( next_[n].Acquire_Load());
-        return (offset != 0) ? reinterpret_cast<Node *>((intptr_t)this - offset) : NULL;
+        return reinterpret_cast<Node*>(next_[n].Acquire_Load());
 #else
         // Use an 'acquire load' so that we observe a fully initialized
         // version of the returned Node.
@@ -197,7 +200,7 @@ struct SkipList<Key,Comparator>::Node {
     void SetNext(int n, Node* x) {
         assert(n >= 0);
 #if defined(USE_OFFSETS)
-        (x != NULL) ? next_[n].Release_Store(reinterpret_cast<void*>((intptr_t)this - (intptr_t)x)) : next_[n].Release_Store(reinterpret_cast<void*>(0));
+        (x != NULL) ? next_[n].Release_Store(reinterpret_cast<void*>((intptr_t)x)) : next_[n].Release_Store(reinterpret_cast<void*>(0));
 #else
         // Use a 'release store' so that anybody who reads through this
         // pointer observes a fully initialized version of the inserted node.
@@ -210,7 +213,7 @@ struct SkipList<Key,Comparator>::Node {
         assert(n >= 0);
 #if defined(USE_OFFSETS)
         intptr_t offset = reinterpret_cast<intptr_t>(next_[n].NoBarrier_Load());
-        return (offset != 0) ? reinterpret_cast<Node *>((intptr_t)this - offset) : NULL;
+        return reinterpret_cast<Node*>(next_[n].NoBarrier_Load());
 #else
         return reinterpret_cast<Node*>(next_[n].NoBarrier_Load());
 #endif
@@ -218,7 +221,7 @@ struct SkipList<Key,Comparator>::Node {
     void NoBarrier_SetNext(int n, Node* x) {
         assert(n >= 0);
 #if defined(USE_OFFSETS)
-        (x != NULL) ? next_[n].NoBarrier_Store( reinterpret_cast<void*> ((intptr_t)this - (intptr_t)x)) : next_[n].NoBarrier_Store( reinterpret_cast<void*> (0));
+        (x != NULL) ? next_[n].NoBarrier_Store( reinterpret_cast<void*> ((intptr_t)x)) : next_[n].NoBarrier_Store( reinterpret_cast<void*> (0));
 #else
         next_[n].NoBarrier_Store(x);
 #endif
@@ -237,11 +240,14 @@ SkipList<Key,Comparator>::NewNode(const Key& key, int height, bool head_alloc) {
     if(arena_->nvmarena_) {
         ArenaNVM *nvm_arena = (ArenaNVM *)arena_;
         if (head_alloc == true)
-            mem = nvm_arena->AllocateAlignedNVM(
+              mem = nvm_arena->AllocateAligned(  
                     sizeof(size_t) + sizeof (uint64_t) + sizeof(int) + sizeof(Node) + sizeof(port::AtomicPointer) * (height - 1));
-        else
-            mem = nvm_arena->AllocateAlignedNVM(
-                    sizeof(Node) + sizeof(port::AtomicPointer) * (height - 1));
+        else {
+            char *key_offset = reinterpret_cast<char *>((intptr_t)key) - (char*)nvm_arena->map_start_;
+            int sub_mem_index = (int)key_offset / SUB_MEM_SIZE;
+            mem = nvm_arena->AllocateAligned_submemIndex(  
+                    sizeof(Node) + sizeof(port::AtomicPointer) * (height - 1), sub_mem_index);
+        }
     }else {
         mem = arena_->AllocateAligned(
                 sizeof(Node) + sizeof(port::AtomicPointer) * (height - 1));
@@ -252,12 +258,12 @@ SkipList<Key,Comparator>::NewNode(const Key& key, int height, bool head_alloc) {
 #ifdef ENABLE_RECOVERY
     if (return_special) {
         char *offset_mem = mem + sizeof(size_t) + sizeof (uint64_t) + sizeof(int);
-        return new (offset_mem) Node(key, mem);
+        return new (offset_mem) Node(key, mem, height);
     } else {
-        return new (mem) Node(key, mem);
+        return new (mem) Node(key, mem, height);
     }
 #else
-    return new (mem) Node(key, mem);
+    return new (mem) Node(key, mem, height);
 #endif
 #endif
 }
@@ -287,6 +293,11 @@ inline const Key& SkipList<Key,Comparator>::Iterator::key_offset() const {
         return node_->key;
 #endif
     }
+
+template<typename Key, class Comparator>
+inline const Key& SkipList<Key,Comparator>::Iterator::set_key_offset(Key new_off) const {
+        node_->key_offset = new_off;
+}
 
     template<typename Key, class Comparator>
     inline void SkipList<Key,Comparator>::Iterator::Next() {
@@ -349,7 +360,7 @@ inline void SkipList<Key,Comparator>::Iterator::SetHead(void *ptr) {
     bool SkipList<Key,Comparator>::KeyIsAfterNode(const Key& key, Node* n) const {
         // NULL n is considered infinite
 #if defined(USE_OFFSETS)
-        return (n != NULL) && (compare_(reinterpret_cast<Key>((intptr_t)n - (intptr_t)n->key_offset), key) < 0);
+        return (n != NULL) && (compare_(reinterpret_cast<Key>((intptr_t)n->key_offset), key) < 0);
 #else
         return (n != NULL) && (compare_(n->key, key) < 0);
 #endif
@@ -449,7 +460,7 @@ inline void SkipList<Key,Comparator>::Iterator::SetHead(void *ptr) {
 #else
             head_ = NewNode(0, kMaxHeight, false);
 #endif
-
+/*
 #ifdef ENABLE_RECOVERY
             if (!recovery && arena->nvmarena_) {
                 ArenaNVM *arena_nvm = (ArenaNVM*) arena;
@@ -466,10 +477,9 @@ inline void SkipList<Key,Comparator>::Iterator::SetHead(void *ptr) {
 		flush_cache(m_height, CACHE_LINE_SIZE);
             }
 #endif
-
+*/
             //NoveLSM: We find the offset from the starting address
             head_offset_ = (reinterpret_cast<void*>(arena_->CalculateOffset(static_cast<void*>(head_))));
-            //head_offset_ = (size_t)(arena_->CalculateOffset(static_cast<void*>(head_)));
 
             if (!recovery) {
                 for (int i = 0; i < kMaxHeight; i++) {
@@ -485,19 +495,8 @@ inline void SkipList<Key,Comparator>::Iterator::SetHead(void *ptr) {
             template<typename Key, class Comparator>
             void SkipList<Key,Comparator>::Insert(const Key& key) {
 #endif
-                // TODO(opt): We can use a barrier-free variant of FindGreaterOrEqual()
-                // here since Insert() is externally synchronized.
                 Node* prev[kMaxHeight];
                 Node* x = FindGreaterOrEqual(key, prev);
-
-                // Update sequence number before updating data
-#ifdef ENABLE_RECOVERY
-                if (arena_->nvmarena_) {
-                    *sequence = s;
-                }
-#endif
-
-                // Our data structure does not allow duplicate insertion
 #if defined(USE_OFFSETS)
                 assert(x == NULL || !Equal(key, reinterpret_cast<Key>((intptr_t)x - (intptr_t)x->key_offset)));
 #else
@@ -509,39 +508,35 @@ inline void SkipList<Key,Comparator>::Iterator::SetHead(void *ptr) {
                     for (int i = GetMaxHeight(); i < height; i++) {
                         prev[i] = head_;
                     }
-                    //fprintf(stderr, "Change height from %d to %d\n", max_height_, height);
 
-                    // It is ok to mutate max_height_ without any synchronization
-                    // with concurrent readers.  A concurrent reader that observes
-                    // the new value of max_height_ will see either the old value of
-                    // new level pointers from head_ (NULL), or a new value set in
-                    // the loop below.  In the former case the reader will
-                    // immediately drop to the next level since NULL sorts after all
-                    // keys.  In the latter case the reader will use the new node.
                     max_height_.NoBarrier_Store(reinterpret_cast<void*>(height));
                 }
 
                 x = NewNode(key, height, false);
                 for (int i = 0; i < height; i++) {
-                    // NoBarrier_SetNext() suffices since we will add a barrier when
-                    // we publish a pointer to "x" in prev[i].
                     x->NoBarrier_SetNext(i, prev[i]->NoBarrier_Next(i));
                     prev[i]->SetNext(i, x);
-                    if (arena_->nvmarena_ == true) {
-                        flush_cache((void *)x, sizeof(Node));
-                        flush_cache((void *)prev[i], sizeof(Node));
-                    }
                 }
-#ifdef ENABLE_RECOVERY
-                if (arena_->nvmarena_) {
-                    *alloc_rem = arena_->getAllocRem();
-                    // Set max_height after insertion to ensure correctness.
-                    // If NovelSM crashes before updating this, it would just
-                    // lead to inefficient lookups (O(n) vs O(logn)).
-                    *m_height = GetMaxHeight();
-                }
-#endif
             }
+
+        template<typename Key, class Comparator>
+        void SkipList<Key,Comparator>::InsertNode(void *n){
+            Node* prev[kMaxHeight];
+            Node* x = FindGreaterOrEqual(((Node*)n)->key_offset, prev);
+            int height = ((Node*)n)->height;
+            if (height > GetMaxHeight()) {
+                for (int i = GetMaxHeight(); i < height; i++) {
+                    prev[i] = head_;
+                }
+                max_height_.NoBarrier_Store(reinterpret_cast<void*>(height));
+            }
+            x = (Node*)n;
+            for (int i = 0; i < height; i++) {
+                x->NoBarrier_SetNext(i, prev[i]->NoBarrier_Next(i));
+                prev[i]->SetNext(i, x);
+            }
+        }
+
 
             template<typename Key, class Comparator>
             bool SkipList<Key,Comparator>::Contains(const Key& key) const {

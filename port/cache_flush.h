@@ -25,7 +25,7 @@ static inline void mfence()
 }
 
 static inline void flush_cache(void *ptr, size_t size){
-
+/*
 #ifdef _ENABLE_PMEMIO
   pmem_persist((const void*)ptr, size);
 #else
@@ -39,6 +39,7 @@ static inline void flush_cache(void *ptr, size_t size){
   }
   mfence();
 #endif
+*/
 }
 
 static inline void memcpy_persist
@@ -47,16 +48,16 @@ static inline void memcpy_persist
 #ifdef _ENABLE_PMEMIO
   pmem_memcpy_persist(dest, (const void *)src, size);
 #else
-  unsigned int  i=0;
-  uint64_t addr = (uint64_t)dest;
+  //unsigned int  i=0;
+  //uint64_t addr = (uint64_t)dest;
   memcpy(dest, src, size);
 
-  mfence();
-  for (i =0; i < size; i=i+CACHE_LINE_SIZE) {
-    clflush((volatile char*)addr);
-    addr += CACHE_LINE_SIZE;
-  }
-  mfence();
+  //mfence();
+  //for (i =0; i < size; i=i+CACHE_LINE_SIZE) {
+  //  clflush((volatile char*)addr);
+  //  addr += CACHE_LINE_SIZE;
+  //}
+  //mfence();
 #endif
 
 }

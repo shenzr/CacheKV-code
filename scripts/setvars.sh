@@ -6,7 +6,7 @@ export TEST_TMPDIR=/mnt/pmemdir
 #DRAM buffer size in MB
 export DRAMBUFFSZ=64
 #NVM buffer size in MB
-export NVMBUFFSZ=4096
+export NVMBUFFSZ=12
 export INPUTXML=$NOVELSMSCRIPT/input.xml
 #Vanilla LevelDB benchmark
 export LEVELDB_VANILLA=$NOVELSMSRC/leveldb-1.20

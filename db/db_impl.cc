@@ -44,9 +44,14 @@
 #include <chrono>
 #include <ctime>
 
+#include <pqos.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 using namespace std;
 
 namespace leveldb {
+std::atomic_int subImmCount;
 
 const int kNumNonTableCacheFiles = 10;
 bool kCheckCond = 0;
@@ -197,6 +202,14 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname_disk, const
           tmp_batch_(new WriteBatch),
           bg_compaction_scheduled_(false),
           manual_compaction_(NULL) {
+    subImmKill = 0;
+    isFirstArena = 1;
+    inSkiplistBgSync.store(0);
+    inCompactImm.store(0);
+    skiplistSync_threshold = options_.skiplistSync_threshold;
+    compactImm_threshold = options_.compactImm_threshold;
+    subImm_partition = options_.subImm_partition;
+    subImm_thread = options_.subImm_thread;
 
     has_imm_.Release_Store(NULL);
 
@@ -217,7 +230,11 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname_disk, const
 }
 
 DBImpl::~DBImpl() {
-
+    ArenaNVM *tmp_arena = reinterpret_cast<ArenaNVM*>(&mem_->arena_);
+    tmp_arena->setSubMemToImm();
+    skiplistBackgroundSync(this);
+    compactImm(this);
+    env_->SleepForMicroseconds(100000);
 #ifdef _ENABLE_STATS
     std::cout << "Foreground compaction time: " << fgcompactime.count() << "s\n";
     fprintf(stderr,"mem_hits %u, imm_hits %u sstable_hits %u\n",
@@ -870,6 +887,156 @@ void DBImpl::BGWork(void* db) {
     reinterpret_cast<DBImpl*>(db)->BackgroundCall();
 }
 
+void DBImpl::skiplistBackgroundSync(void *db) {
+    MemTable* tmp_mem = reinterpret_cast<DBImpl*>(db)->mem_;
+    int pending, index;
+    for(int i=0; i<tmp_mem->arena_.sub_mem_count; i++) {
+        if(tmp_mem->arena_.sub_mem_bset[i] && !tmp_mem->arena_.in_trans_bset[i].load() && !tmp_mem->arena_.in_trans_bset[i].exchange(1)) {
+            pending = tmp_mem->sub_mem_pending_node[i].size();
+            index = tmp_mem->sub_mem_pending_node_index[i];
+            if(index < pending) {
+                char *buf;
+                for(int j=index; j<pending; j++){
+                    buf = tmp_mem->sub_mem_pending_node[i][j];
+                    tmp_mem->sub_mem_skiplist[i].Insert(buf);
+                }
+                tmp_mem->sub_mem_pending_node_index[i] = pending;
+            }
+            tmp_mem->arena_.in_trans_bset[i].store(0);
+        }
+    }
+    reinterpret_cast<DBImpl*>(db)->inSkiplistBgSync.store(0);
+}
+
+
+
+void DBImpl::subImmToImm(void *work) {
+    work_struct *p = (work_struct*)work;
+    void *db = (void*)p->db;
+    int ImmNum = p->index;
+    free(p);
+    if(ImmNum > reinterpret_cast<DBImpl*>(db)->subImm_thread){
+	    return ;
+    }
+    MemTable* tmp_mem = reinterpret_cast<DBImpl*>(db)->mem_;
+    int sub_imm_index = -1;
+    int n = tmp_mem->arena_.sub_mem_count / reinterpret_cast<DBImpl*>(db)->subImm_thread;
+    int begin = n*ImmNum;
+    int end = begin + n;
+    if(!reinterpret_cast<DBImpl*>(db)->subImm_partition) {
+        begin = 0;
+        end = tmp_mem->arena_.sub_mem_count;
+    }
+
+retry:
+    for(int i=begin; i<end; i++)
+        if(tmp_mem->arena_.sub_immem_bset[i].load() 
+        && tmp_mem->arena_.sub_immem_bset[i].exchange(0)) {
+            sub_imm_index = i;
+            break;
+        }
+            
+    if(sub_imm_index == -1) {
+        if(reinterpret_cast<DBImpl*>(db)->subImmKill) {
+            subImmCount--;
+            return;
+        }
+        goto retry;
+    }
+    tmp_mem->arena_.sub_immem_count--;
+    while(1) {
+        if(!tmp_mem->arena_.in_trans_bset[sub_imm_index].load() && !tmp_mem->arena_.in_trans_bset[sub_imm_index].exchange(1))
+            break;
+    }
+
+    MemTable *imm = reinterpret_cast<DBImpl*>(db)->CreateNVMtable(false);
+    ArenaNVM *imm_arena = (ArenaNVM*)&imm->arena_;
+    imm_arena->isDataLock = 0;
+    imm_arena->AllocateFallbackNVM(SUB_MEM_SIZE);
+
+    int pending = tmp_mem->sub_mem_pending_node[sub_imm_index].size();
+    int index = tmp_mem->sub_mem_pending_node_index[sub_imm_index];
+    if(index < pending) {
+        char *buf;
+        for(int j=index; j<pending; j++){
+            buf = tmp_mem->sub_mem_pending_node[sub_imm_index][j];
+            tmp_mem->sub_mem_skiplist[sub_imm_index].Insert(buf);
+        }
+        tmp_mem->sub_mem_pending_node_index[sub_imm_index] = pending;
+    }
+
+    memcpy(imm->arena_.map_start_, tmp_mem->arena_.map_start_ + SUB_MEM_SIZE * sub_imm_index, SUB_MEM_SIZE);
+    for(int i=0; i < tmp_mem->table_.kMaxHeight; i++) {
+        imm->table_.head_->SetNext(i, tmp_mem->sub_mem_skiplist[sub_imm_index].head_->Next(i));
+        tmp_mem->sub_mem_skiplist[sub_imm_index].head_->SetNext(i, NULL);
+    }
+    MemTable::Table::Iterator iter(&imm->table_);
+    char* new_off;
+    char *off;
+    off = (char*)imm->arena_.map_start_ - (char*)(tmp_mem->arena_.map_start_ + SUB_MEM_SIZE * sub_imm_index);
+    for (iter.SeekToFirst(); iter.Valid(); iter.Next()) {
+        new_off = (intptr_t)iter.key_offset() + off;
+        iter.set_key_offset(new_off);
+    }
+
+    tmp_mem->sub_mem_pending_node[sub_imm_index].clear();
+    tmp_mem->sub_mem_pending_node_index[sub_imm_index] = 0;
+
+    imm->arena_.blocks_ = tmp_mem->arena_.skiplist_blocks[sub_imm_index];
+    tmp_mem->arena_.skiplist_blocks[sub_imm_index].clear();
+
+    tmp_mem->arena_.sub_immem_bset[sub_imm_index].store(false);
+    tmp_mem->arena_.sub_mem_bset[sub_imm_index].store(false);
+
+    while(tmp_mem->isQueBusy.load());
+    tmp_mem->subImmQue.push_front(imm);
+    tmp_mem->arena_.in_trans_bset[sub_imm_index].store(0);
+
+    sub_imm_index = -1;
+    goto retry;
+}
+
+void DBImpl::compactImm(void* db) {
+    if(!reinterpret_cast<DBImpl*>(db)->inCompactImm.load() 
+    && !reinterpret_cast<DBImpl*>(db)->inCompactImm.exchange(1)){
+
+    }
+    else{
+        return;
+    }
+
+    MemTable* tmp_mem = reinterpret_cast<DBImpl*>(db)->mem_;
+    MemTable* sub_imm;
+    std::deque<MemTable*> tmp_subImmQue;
+loop:
+    if(!tmp_mem->isQueBusy.load() && !tmp_mem->isQueBusy.exchange(1)){
+        std::swap(tmp_subImmQue, tmp_mem->subImmQue);
+    }
+    else{
+        return;
+    }
+    tmp_mem->isQueBusy.store(0);
+
+    for(int i=0; i<tmp_subImmQue.size(); i++) {
+        sub_imm = tmp_subImmQue[i];
+        MemTable::Table::Iterator iter(&(sub_imm->table_));
+        iter.SeekToFirst();
+        void *p;
+        while(iter.Valid()){
+            p = (void*)iter.node_;
+            iter.Next();
+            tmp_mem->table_.InsertNode(p);
+        }
+        reinterpret_cast<DBImpl*>(db)->compactImmQue.push_back(sub_imm);
+    }
+    tmp_subImmQue.clear();
+    if(tmp_mem->subImmQue.size() > reinterpret_cast<DBImpl*>(db)->compactImm_threshold){
+		goto loop;
+	}
+    reinterpret_cast<DBImpl*>(db)->inCompactImm.store(0);
+}
+
+
 void DBImpl::BackgroundCall() {
     MutexLock l(&mutex_);
     assert(bg_compaction_scheduled_);
@@ -893,7 +1060,7 @@ void DBImpl::BackgroundCompaction() {
 
     mutex_.AssertHeld();
 
-    if (imm_ != NULL) {
+    if (versions_->NumLevelFiles(0) < config::kL0_SlowdownWritesTrigger && imm_ != NULL) {
         CompactBottomMemTable();
         return;
     }
@@ -1271,9 +1438,21 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
     std::vector<Iterator*> list;
     list.push_back(mem_->NewIterator());
     mem_->Ref();
-    if (imm_ != NULL) {
-        list.push_back(imm_->NewIterator());
-        imm_->Ref();
+
+    if(!inSkiplistBgSync.load() && !inSkiplistBgSync.exchange(1)) {
+        skiplistBackgroundSync((void*)this);
+    }
+    else {
+        while(!inSkiplistBgSync.load());
+    }
+
+    if(mem_->subImmQue.size() && !inCompactImm.load()){
+	    compactImm((void*)this);
+    }
+
+    for(int i=0; i<mem_->arena_.sub_mem_count; i++) {
+        if(mem_->arena_.sub_mem_bset[i].load() || mem_->arena_.sub_immem_bset[i].load())
+	        list.push_back(mem_->NewSubMemIterator(i));
     }
     versions_->current()->AddIterators(options, &list);
     Iterator* internal_iter =
@@ -1384,148 +1563,49 @@ bool DBImpl::CheckSearchCondition(MemTable* mem){
     return true;
 }
 
-
-/*Not a must to disable this, the code checks
-for multi-level presence*/ 
-//#ifdef MULTILEVEL_IMMUTABLE
 Status DBImpl::Get(const ReadOptions& options,
-        const Slice& key,
-        std::string* value) {
-    Status s, sfail;
-    MutexLock l(&mutex_);
-    SequenceNumber snapshot;
-    Version* current = versions_->current();
-    bool have_stat_update = false;
-    Version::GetStats stats;
+                   const Slice& key,
+                   std::string* value) {
+  Status s;
 
-    g_mem = mem_;
-    g_imm = imm_;
+  if(!inSkiplistBgSync.load() && !inSkiplistBgSync.exchange(1)) {
+    skiplistBackgroundSync((void*)this);
+  }
+  else {
+    while(!inSkiplistBgSync.load());
+  }
 
-    if (options.snapshot != NULL) {
-        snapshot = reinterpret_cast<const SnapshotImpl*>
-        (options.snapshot)->number_;
-    } else {
-        snapshot = versions_->LastSequence();
-    }
+  if(mem_->subImmQue.size() && !inCompactImm.load()){
+	compactImm((void*)this);
+  }
 
-    g_mem->Ref();
-    if (g_imm != NULL) g_imm->Ref();
-    current->Ref();
+  MutexLock l(&mutex_);
+  SequenceNumber snapshot;
+  if (options.snapshot != NULL) {
+    snapshot = reinterpret_cast<const SnapshotImpl*>(options.snapshot)->number_;
+  } else {
+    snapshot = versions_->LastSequence();
+  }
 
-    if(current)
-        current->ResetTerminate();
+  MemTable* mem = mem_;
+  g_mem = mem_;
+  mem->Ref();
 
-    //Clear global flags
-    mem_found = false;
-    sstable_found = false;
+  Version::GetStats stats;
 
-    g_options = options;
-    // Unlock while reading from files and memtables
+  {
     mutex_.Unlock();
-    // First look in the memtable, then in the immutable memtable (if any).
     LookupKey lkey(key, snapshot);
-    read_struct str[NUM_READ_THREADS+1];
-    bool done = false;
-    int num_threads = num_read_threads;
-    int ret=0;
-
-    if(predict_on)
-        knvmhit = mem_->CheckPredictIndex(&mem_->predict_set,
-                (const uint8_t*)key.data());
-
-    if ((num_threads >= 1) && thpool) {
-        kCheckCond = 0;
-        for (int i = 0; i < num_threads; i++) {
-            if(predict_on && knvmhit)
-                goto no_thread;
-            //str[i].val = SSTBL_THRD;
-            str[i].val = MEMTBL_THRD;
-            str[i].lkey = &lkey;
-            str[i].db = this;
-            str[i].value = value;
-            str[i].done = false;
-            str[i].current = current;
-            str[i].stats = &stats;
-            str[i].have_stat_update = &have_stat_update;
-            str[i].s = &s;
-            thpool_add_work(thpool, read_thread, &str[i]);
-            //read_thread(&str[i]);
-        }
-
-        if ((str[0].val != MEMTBL_THRD)) {
-            if (g_mem && g_mem->Get(lkey, value, &s)) {
-                done =true;
-                kCheckCond = true;
-                mem_found = true;
-                goto pool_wait;
-            }
-            if (g_imm && g_imm->Get(lkey, value, &s)) {
-                done =true;
-                kCheckCond = true;
-                imm_found = true;
-            }
-        }else {
-            s = current->Get(options, lkey, value, &stats);
-            sstable_found = true;
-        }
-        pool_wait:
-        //if(!done)
-        thpool_wait(thpool);
-
-        for (int i = 0; i < num_threads; i++) {
-            //Wait for the thread pool to complete
-            if(str[i].done == true) {
-                done =true;
-                s = Status::OK();
-                if(i > 0)
-                    have_stat_update = false;
-
-                goto found_key;
-            }
-        }
-        if(sstable_found == true){
-            have_stat_update = true;
-            done  = true;
-        }
-        if(done == true)
-            s = Status::OK();
-        else
-            s = Status::NotFound(Slice());
-    }
+    if(mem->Get_submem(lkey, value, &s)) {}
     else {
-
-no_thread:
-        //TODO: Add a macro condition
-        if (CheckSearchCondition(mem_) && mem_->Get(lkey, value, &s)) {
-            done =true;
-            mem_found = true;
-        }
-        else if (CheckSearchCondition(imm_) && imm_->Get(lkey, value, &s)) {
-            done =true;
-            imm_found = true;
-        }else {
-            s = current->Get(options, lkey, value, &stats);
-            have_stat_update = true;
-            sstable_found = true;
-        }
-        if(done == true)
-            s = Status::OK();
+        mem_->Get(lkey, value, &s);
     }
-    found_key:
+end:
     mutex_.Lock();
+  }
 
-#ifdef _ENABLE_STATS
-    //Increment stats counter
-    IncrementHitFlag();
-#endif
-    //fprintf(stderr, "have_stat_update %u \n", have_stat_update);
-    if (have_stat_update && current->UpdateStats(stats)) {
-        MaybeScheduleCompaction();
-    }
-    g_mem->Unref();
-    if (g_imm != NULL) g_imm->Unref();
-    current->Unref();
-    return s;
+  mem->Unref();
+  return s;
 }
 
 Iterator* DBImpl::NewIterator(const ReadOptions& options) {
@@ -1572,85 +1652,19 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
     w.sync = options.sync;
     w.done = false;
 
-
-    MutexLock l(&mutex_);
-    writers_.push_back(&w);
-    while (!w.done && &w != writers_.front()) {
-        w.cv.Wait();
-    }
-    if (w.done) {
-        return w.status;
-    }
-
-    // May temporarily unlock and wait.
     Status status;
-
-#ifdef _ENABLE_STATS
-    std::chrono::time_point<std::chrono::system_clock> start, end;
-    start = std::chrono::system_clock::now();
-#endif
-    // May temporarily unlock and wait.
     status = MakeRoomForWrite(my_batch == NULL);
-#ifdef _ENABLE_STATS
-    end = std::chrono::system_clock::now();
-    fgcompactime = fgcompactime + (end-start);
-#endif
 
-    uint64_t last_sequence = versions_->LastSequence();
-    Writer* last_writer = &w;
-    if (status.ok() && my_batch != NULL) {  // NULL batch is for compactions
-        WriteBatch* updates = BuildBatchGroup(&last_writer);
-        WriteBatchInternal::SetSequence(updates, last_sequence + 1);
-        last_sequence += WriteBatchInternal::Count(updates);
+    if (status.ok() && my_batch != NULL) { 
+        WriteBatch* updates = my_batch;
 
-        // Add to log and apply to memtable.  We can release the lock
-        // during this phase since &w is currently responsible for logging
-        // and protects against concurrent loggers and concurrent writes
-        // into mem_.
         {
-            mutex_.Unlock();
-            bool sync_error = false;
-            if (!mem_->isNVMMemtable) {
-                status = log_->AddRecord(WriteBatchInternal::Contents(updates));
-                if (status.ok() && options.sync) {
-                    status = logfile_->Sync();
-                    if (!status.ok()) {
-                        sync_error = true;
-                    }
-                }
-            }
-            else
-                status = Status::OK();
+            status = Status::OK();
             if (status.ok()) {
                 status = WriteBatchInternal::InsertInto(updates, mem_);
             }
-            mutex_.Lock();
-            if (sync_error) {
-                // The state of the log file is indeterminate: the log record we
-                // just added may or may not show up when the DB is re-opened.
-                // So we force the DB into a mode where all future writes fail.
-                RecordBackgroundError(status);
-            }
         }
-        if (updates == tmp_batch_) tmp_batch_->Clear();
-
-        versions_->SetLastSequence(last_sequence);
-    }
-
-    while (true) {
-        Writer* ready = writers_.front();
-        writers_.pop_front();
-        if (ready != &w) {
-            ready->status = status;
-            ready->done = true;
-            ready->cv.Signal();
-        }
-        if (ready == last_writer) break;
-    }
-
-    // Notify new head of write queue
-    if (!writers_.empty()) {
-        writers_.front()->cv.Signal();
+        versions_->SetLastSequence(WriteBatchInternal::Count(updates));
     }
     assert(mem_->GetNumKeys());
     return status;
@@ -1781,73 +1795,42 @@ int DBImpl::SwapMemtables() {
 Status DBImpl::MakeRoomForWrite(bool force) {
     mutex_.AssertHeld();
     assert(!writers_.empty());
-    bool allow_delay = !force;
-    size_t size_mem = 0, size_mem2 = 0;
     Status s;
-    bool skip_imm = false;
 
     while (true) {
-        skip_imm = false;
+        int tmp_imm_count = 0;
+        int tmp_mem_count = 0;
+        for(int i=0; i<mem_->arena_.sub_mem_count; i++) {
+            if(mem_->arena_.sub_immem_bset[i].load())
+                tmp_imm_count++;
+            if(mem_->arena_.sub_mem_bset[i].load())
+                tmp_mem_count++;
+        }
         if (!bg_error_.ok()) {
             // Yield previous error
             s = bg_error_;
             break;
-        } else if (
-                allow_delay &&
-                versions_->NumLevelFiles(0) >= config::kL0_SlowdownWritesTrigger) {
-            // We are getting close to hitting a hard limit on the number of
-            // L0 files.  Rather than delaying a single write by several
-            // seconds when we hit the hard limit, start delaying each
-            // individual write by 1ms to reduce latency variance.  Also,
-            // this delay hands over some CPU to the compaction thread in
-            // case it is sharing the same core as the writer.
-            mutex_.Unlock();
-            env_->SleepForMicroseconds(1000);
-            allow_delay = false;  // Do not delay a single write more than once
-            mutex_.Lock();
-        } else if (!force &&
-                ((size_mem = mem_->ApproximateMemoryUsage()) < options_.write_buffer_size)) {
-            // There is room in current memtable
-            break;
-        }
-        else if (imm_ != NULL) {
-            // We have filled up the current memtable, but the previous
-            // one is still being compacted, so we wait.
-            Log(options_.info_log, "Current memtable full; waiting...\n");
-            bg_cv_.Wait();
-        }
-        else if (versions_->NumLevelFiles(0) >= config::kL0_StopWritesTrigger) {
-            // There are too many level-0 files.
-            Log(options_.info_log, "Too many L0 files; waiting...\n");
-            bg_cv_.Wait();
-        } else {
-            assert(versions_->PrevLogNumber() == 0);
-#if !defined(ENABLE_RECOVERY)
-            // Attempt to switch to a new memtable and trigger compaction of old
-            uint64_t new_log_number = versions_->NewFileNumber();
-            WritableFile* lfile = NULL;
-            s = env_->NewWritableFile(LogFileName(dbname_disk_, new_log_number), &lfile);
-            if (!s.ok()) {
-                // Avoid chewing through file number space in a tight loop.
-                versions_->ReuseFileNumber(new_log_number);
-                break;
+        } else if (tmp_imm_count && !subImmCount.exchange(1)) {
+            work_struct *job;
+            for(int i=0; i<subImm_thread; i++) {
+                job = (work_struct*)malloc(sizeof(work_struct));
+                job->db = this;
+                job->index = i;
+                env_->Schedule(&DBImpl::subImmToImm, (void*)job);
+                job = NULL;
             }
-            delete log_;
-            delete logfile_;
-            logfile_ = lfile;
-            log_ = new log::Writer(lfile);
-#endif
-            MemTable *imm = mem_;
-            if(predict_on)
-                mem_->ClearPredictIndex(&mem_->predict_set);
-            SwapMemtables();
-            imm_ = imm;
-            has_imm_.Release_Store(imm_);
-            mem_->Ref();
-            force = false;   // Do not force another compaction if have room
-            MaybeScheduleCompaction();
-        }
+            break;
+        } else if(compactImm_threshold>0 && mem_->subImmQue.size()>compactImm_threshold && !inCompactImm.load()) {
+                env_->Schedule(&DBImpl::compactImm, (void*)this);
+        } else if (tmp_mem_count < mem_->arena_.sub_mem_count)
+                break;
     }
+
+    if(skiplistSync_threshold>0 && mem_->GetNumKeys()>1 && (mem_->GetNumKeys() % skiplistSync_threshold == 1) 
+    && !inSkiplistBgSync.load() && !inSkiplistBgSync.exchange(1)) {
+        env_->Schedule(&DBImpl::skiplistBackgroundSync, (void*)this);
+    }
+
     return s;
 }
 
@@ -1958,7 +1941,57 @@ Status DB::Delete(const WriteOptions& opt, const Slice& key) {
     return Write(opt, &batch);
 }
 
-DB::~DB() { }
+static int
+init_pqos(void)
+{
+    const struct pqos_cpuinfo *p_cpu = NULL;
+    const struct pqos_cap *p_cap = NULL;
+    struct pqos_config cfg;
+    int ret;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.fd_log = STDOUT_FILENO;
+    cfg.verbose = 0;
+    ret = pqos_init(&cfg);
+    if (ret != PQOS_RETVAL_OK) {
+        printf("Error initializing PQoS library!\n");
+        return -1;
+    }
+
+    ret = pqos_cap_get(&p_cap, &p_cpu);
+    if (ret != PQOS_RETVAL_OK) {
+        pqos_fini();
+        printf("Error retrieving PQoS capabilities!\n");
+        return -1;
+    }
+
+    ret = pqos_alloc_reset(PQOS_REQUIRE_CDP_ANY, PQOS_REQUIRE_CDP_ANY,
+                            PQOS_MBA_ANY);
+    if (ret != PQOS_RETVAL_OK) {
+        pqos_fini();
+        printf("Error resetting CAT!\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+close_pqos(void)
+{
+    int ret_val = 0;
+
+    if (pqos_fini() != PQOS_RETVAL_OK) {
+        printf("Error shutting down PQoS library!\n");
+        ret_val = -1;
+    }
+
+    return ret_val;
+}
+
+DB::~DB() {
+    close_pqos();
+ }
 
 Status DB::Open(const Options& options, const std::string& dbname_disk,
         const std::string& dbname_mem, DB** dbptr) {
@@ -1967,15 +2000,8 @@ Status DB::Open(const Options& options, const std::string& dbname_disk,
     impl->mutex_.Lock();
     VersionEdit edit;
 
-    if(num_read_threads && !impl->thpool) {
-	if(num_read_threads > 1) {
-	    //For beta version, we are limiting the 
-	    //read threads to just 2 (one for memtables 
-	    // and one for SSTable
-	    num_read_threads = 1;
-	}
-        impl->thpool = thpool_init(num_read_threads);
-    }
+    size_t subMemSize = SUB_MEM_SIZE;
+    subImmCount.store(0);
 
     // Recover handles create_if_missing, error_if_exists
     bool save_manifest = false;
@@ -1999,8 +2025,32 @@ Status DB::Open(const Options& options, const std::string& dbname_disk,
                 impl->logfile_ = lfile;
                 impl->log_ = new log::Writer(lfile);
                 if (impl->mem_ == NULL) {
-                    impl->mem_ = new MemTable(impl->internal_comparator_);
-                    impl->mem_->isNVMMemtable = false;
+                    if (init_pqos() != 0) {
+                        (void)close_pqos();
+                    }
+#if defined(ENABLE_RECOVERY)
+                    uint64_t new_map_number = impl->versions_->NewFileNumber();
+                    size_t size = 0;
+                    std::string filename = MapFileName(impl->dbname_mem_, new_map_number);
+                    size = impl->nvmbuff_;
+                    impl->mapfile_number_ = new_map_number;
+                    ArenaNVM *arena= new ArenaNVM(size, &filename, false);
+                    if(impl->isFirstArena) {
+                        arena->isDataLock = impl->isFirstArena;
+                        arena->dlock_way = options.dlock_way;
+                        arena->dlock_size = options.dlock_size;
+                        impl->isFirstArena = 0;
+                        arena->Allocate(1);
+                        arena->reclaim_sub_mem(-1);
+                    }
+                    else
+                        arena->isDataLock = impl->isFirstArena;
+#else
+                    ArenaNVM *arena= new ArenaNVM();
+#endif
+                    impl->mem_ = new MemTable(impl->internal_comparator_, *arena, false);
+                    impl->mem_->isNVMMemtable = true;
+
 #if defined(ENABLE_RECOVERY)
                     impl->logfile_number_ = new_log_number;
 #else

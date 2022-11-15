@@ -83,6 +83,12 @@ struct Options {
   size_t write_buffer_size;
   size_t nvm_buffer_size;
   int num_levels;
+  size_t dlock_way;
+  size_t dlock_size;
+  size_t skiplistSync_threshold;
+  size_t compactImm_threshold;
+  size_t subImm_partition;
+  size_t subImm_thread;
   // Number of open files that can be used by the DB.  You may need to
   // increase this if your database has a large working set (budget
   // one open file per 2MB of working set).

@@ -78,6 +78,7 @@ public:
     virtual void GetApproximateSizes(const Range* range, int n, uint64_t* sizes);
     virtual void CompactRange(const Slice* begin, const Slice* end);
 
+
     // Extra methods (for testing) that are not in the public DB interface
 
     // Compact any files in the named level that overlap [*begin,*end]
@@ -129,12 +130,34 @@ public:
         bool done;
         Version* current;
         void *stats;
+        int subImmSeq;
+        int begin;
+        int len;
         //const leveldb::ReadOptions *myoptions;
     }read_struct;
+    std::atomic_bool isReadDone;
+    
+    typedef struct work_struct {
+            DBImpl *db;
+            int index;
+    }work_struct;
 
     //NoveLSM Swap/Alternate between NVM and DRAM arena
     size_t drambuff_;
     size_t nvmbuff_;
+
+    bool isFirstArena;
+    std::atomic_bool inSkiplistBgSync;
+    volatile bool subImmKill;
+
+    static void compactImm(void* db);
+    std::deque<MemTable*> compactImmQue;
+    std::atomic_bool inCompactImm;
+
+    size_t skiplistSync_threshold;
+    size_t compactImm_threshold;
+    size_t subImm_partition;
+    size_t subImm_thread;
 
 private:
     friend class DB;
@@ -194,6 +217,9 @@ private:
     void MaybeScheduleCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
     void ScheduleCompactionNow();
     static void BGWork(void* db);
+    static void skiplistBackgroundSync(void* db);
+    static void subImmToImm(void* work);
+
     void BackgroundCall();
     void  BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
     void CleanupCompaction(CompactionState* compact)

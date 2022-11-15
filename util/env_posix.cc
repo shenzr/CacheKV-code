@@ -24,6 +24,9 @@
 #include "util/mutexlock.h"
 #include "util/posix_logger.h"
 
+#include <atomic>
+#define THREAD_COUNT 8
+
 namespace leveldb {
 
 namespace {
@@ -331,6 +334,8 @@ public:
 
 class PosixEnv : public Env {
 public:
+    std::atomic_int thread_count;
+
     PosixEnv();
     virtual ~PosixEnv() {
         char msg[] = "Destroying Env::Default()\n";
@@ -586,17 +591,26 @@ private:
 PosixEnv::PosixEnv() : started_bgthread_(false) {
     PthreadCall("mutex_init", pthread_mutex_init(&mu_, NULL));
     PthreadCall("cvar_init", pthread_cond_init(&bgsignal_, NULL));
+
+    thread_count.store(0);
 }
 
 void PosixEnv::Schedule(void (*function)(void*), void* arg) {
-    PthreadCall("lock", pthread_mutex_lock(&mu_));
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    for(int i=0; i<16; i++)
+        CPU_SET(i*2, &cpuset);
 
+    PthreadCall("lock", pthread_mutex_lock(&mu_));
     // Start background thread if necessary
-    if (!started_bgthread_) {
-        started_bgthread_ = true;
+    //if (!started_bgthread_) {
+    //    started_bgthread_ = true;
+    if (thread_count.load() < THREAD_COUNT) {
+        thread_count++;
         PthreadCall(
-                "create thread",
-                pthread_create(&bgthread_, NULL,  &PosixEnv::BGThreadWrapper, this));
+            "create thread",
+            pthread_create(&bgthread_, NULL,  &PosixEnv::BGThreadWrapper, this));
+        pthread_setaffinity_np(bgthread_, sizeof(cpu_set_t), &cpuset);
     }
 
     // If the queue is currently empty, the background thread may currently be

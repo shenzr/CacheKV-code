@@ -15,6 +15,8 @@
 #include <string>
 #include <unordered_set>
 
+#include <deque>
+
 namespace leveldb {
 
 class InternalKeyComparator;
@@ -74,6 +76,8 @@ public:
 	// db/format.{h,cc} module.
 	Iterator* NewIterator();
 
+	Iterator* NewSubMemIterator(int index);
+
 	// Add an entry into memtable that maps key to value at the
 	// specified sequence number and with the specified type.
 	// Typically value will be empty if type==kTypeDeletion.
@@ -89,6 +93,7 @@ public:
 	// in *status and return true.
 	// Else, return false.
 	bool Get(const LookupKey& key, std::string* value, Status* s);
+	bool Get_submem(const LookupKey& key, std::string* value, Status* s);
 
 	void SetMemTableHead(void *ptr);
 
@@ -110,20 +115,27 @@ public:
        int  CheckPredictIndex(std::unordered_set<std::string> *set, const uint8_t*);
        void ClearPredictIndex(std::unordered_set<std::string> *set);
 
-private:
-	~MemTable();  // Private since only Unref() should be used to delete it
-
 	struct KeyComparator {
 		const InternalKeyComparator comparator;
 		explicit KeyComparator(const InternalKeyComparator& c) : comparator(c) { }
 		int operator()(const char* a, const char* b) const;
 	};
+	KeyComparator comparator_;
+	typedef SkipList<const char*, KeyComparator> Table;
+	Table sub_imm_skiplist;
+    Table *sub_mem_skiplist;
+	int *sub_mem_pending_node_index;
+    std::vector<char*> *sub_mem_pending_node;
+    std::deque<MemTable*> subImmQue;
+	std::atomic_bool isQueBusy;
+	
+	Table table_;
+private:
+	~MemTable();  // Private since only Unref() should be used to delete it
+
 	friend class MemTableIterator;
 	friend class MemTableBackwardIterator;
 
-	typedef SkipList<const char*, KeyComparator> Table;
-
-	KeyComparator comparator_;
 	int refs_;
 
 	//NoveLSM: Num memtable enteries
@@ -132,7 +144,7 @@ private:
 	//NoveLSM: Making them public for easier debugging
 	//TODO: Revert back to private mode
 	//Arena arena_;
-	Table table_;
+	//Table table_;
 
 	// No copying allowed
 	MemTable(const MemTable&);

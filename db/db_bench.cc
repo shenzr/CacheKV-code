@@ -94,6 +94,13 @@ static size_t FLAGS_nvm_buffer_size = 0;
 static int FLAGS_num_levels = 1;
 static int FLAGS_num_read_threads=0;
 
+static size_t FLAGS_dlock_way = 11; 
+static size_t FLAGS_dlock_size = 33554432; 
+static size_t FLAGS_skiplistSync_threshold = 65536;
+static size_t FLAGS_compactImm_threshold = 10;
+static size_t FLAGS_subImm_partition = 0;
+static size_t FLAGS_subImm_thread = 4;
+
 // Number of bytes to use as a cache of uncompressed data.
 // Negative means use default settings.
 static int FLAGS_cache_size = -1;
@@ -549,6 +556,9 @@ public:
             }
 
             if (method != NULL) {
+                DBImpl *impl = (DBImpl*)db_;
+                while(impl->inCompactImm.load()){
+                }
                 RunBenchmark(num_threads, name, method);
             }
         }
@@ -566,6 +576,15 @@ private:
         ThreadArg* arg = reinterpret_cast<ThreadArg*>(v);
         SharedState* shared = arg->shared;
         ThreadState* thread = arg->thread;
+
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(thread->tid*2 + 2, &cpuset);
+
+        pthread_t pthread;
+        pthread = pthread_self();
+        pthread_setaffinity_np(pthread, sizeof(cpu_set_t), &cpuset);
+
         {
             MutexLock l(&shared->mu);
             shared->num_initialized++;
@@ -725,6 +744,14 @@ private:
         options.reuse_logs = FLAGS_reuse_logs;
         options.num_levels = FLAGS_num_levels;
         options.num_read_threads = FLAGS_num_read_threads;
+        options.dlock_way = FLAGS_dlock_way;
+        options.dlock_size = FLAGS_dlock_size;
+        options.skiplistSync_threshold = FLAGS_skiplistSync_threshold;
+        options.compactImm_threshold = FLAGS_compactImm_threshold;
+        options.subImm_partition = FLAGS_subImm_partition;
+        options.subImm_thread = FLAGS_subImm_thread;
+
+
         Status s = DB::Open(options, FLAGS_db_disk, FLAGS_db_mem, &db_);
         if (!s.ok()) {
             fprintf(stderr, "open error: %s\n", s.ToString().c_str());
@@ -1058,6 +1085,20 @@ int main(int argc, char** argv) {
         } else if (sscanf(argv[i], "--nvm_buffer_size=%d%c", &n, &junk) == 1) {
             FLAGS_nvm_buffer_size = n*1024L*1024L;
             //fprintf(stderr,"FLAGS_nvm_buffer_size %zu\n", FLAGS_nvm_buffer_size);
+
+        } else if (sscanf(argv[i], "--dlock_way=%d%c", &n, &junk) == 1) {
+            FLAGS_dlock_way = n;
+        } else if (sscanf(argv[i], "--dlock_size=%d%c", &n, &junk) == 1) {
+            FLAGS_dlock_size = n;
+        } else if (sscanf(argv[i], "--skiplistSync_threshold=%d%c", &n, &junk) == 1) {
+            FLAGS_skiplistSync_threshold = n;
+        } else if (sscanf(argv[i], "--compactImm_threshold=%d%c", &n, &junk) == 1) {
+            FLAGS_compactImm_threshold = n;
+        } else if (sscanf(argv[i], "--subImm_partition=%d%c", &n, &junk) == 1) {
+            FLAGS_subImm_partition = n;
+        } else if (sscanf(argv[i], "--subImm_thread=%d%c", &n, &junk) == 1) {
+            FLAGS_subImm_thread = n;
+
         } else if (sscanf(argv[i], "--cache_size=%d%c", &n, &junk) == 1) {
             FLAGS_cache_size = n;
         } else if (sscanf(argv[i], "--bloom_bits=%d%c", &n, &junk) == 1) {

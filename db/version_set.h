@@ -23,6 +23,8 @@
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
+#include <atomic>
+
 namespace leveldb {
 
 namespace log { class Writer; }
@@ -212,12 +214,13 @@ class VersionSet {
   int64_t NumLevelBytes(int level) const;
 
   // Return the last sequence number.
-  uint64_t LastSequence() const { return last_sequence_; }
+  uint64_t LastSequence() const { return last_sequence_.load(); }
 
   // Set the last sequence number to s.
   void SetLastSequence(uint64_t s) {
     assert(s >= last_sequence_);
-    last_sequence_ = s;
+    //last_sequence_ = s;
+    last_sequence_.fetch_add(s);
   }
 
   // Mark the specified file number as used.
@@ -310,7 +313,8 @@ class VersionSet {
   const InternalKeyComparator icmp_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;
-  uint64_t last_sequence_;
+  //uint64_t last_sequence_;
+  std::atomic<uint64_t> last_sequence_;
   uint64_t log_number_;
 #if defined(ENABLE_RECOVERY)
   uint64_t map_number_;
